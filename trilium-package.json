@@ -1,0 +1,114 @@
+{
+  "id": "iansherr/gmail-ingest",
+  "version": "0.1.0",
+  "name": "Gmail Ingest",
+  "description": "Import Gmail messages carrying a configured label into Trilium, including HTML/text content and attachments.",
+  "author": "Ian Sherr",
+  "maintainer": "Ian Sherr",
+  "repository": "https://github.com/iansherr/trilium_mail",
+  "homepage": "https://github.com/iansherr/trilium_mail",
+  "license": "MIT",
+  "maintenance": "active",
+  "securityStatus": "warning",
+  "compatibility": { "minTriliumVersion": "0.104.0" },
+  "permissions": ["read-notes", "write-notes", "network", "backend", "custom-endpoint"],
+  "settings": [
+    {
+      "key": "clientId",
+      "type": "string",
+      "title": "Google OAuth client ID",
+      "description": "OAuth 2.0 Web application client ID from Google Cloud Console.",
+      "default": ""
+    },
+    {
+      "key": "clientSecret",
+      "type": "secret",
+      "title": "Google OAuth client secret",
+      "description": "OAuth 2.0 client secret. Keep this private to this Trilium instance.",
+      "default": ""
+    },
+    {
+      "key": "redirectUri",
+      "type": "string",
+      "title": "OAuth redirect URI",
+      "description": "Optional exact callback URL. Leave blank to infer https://host/custom/gmail-ingest/oauth/callback from the current request.",
+      "default": ""
+    },
+    {
+      "key": "targetNoteId",
+      "type": "string",
+      "title": "Import parent note ID",
+      "description": "Trilium note ID under which imported email notes will be created. The default is root.",
+      "default": "root"
+    },
+    {
+      "key": "ingestLabel",
+      "type": "string",
+      "title": "Gmail ingest label",
+      "description": "Messages with this Gmail label are imported.",
+      "default": "trilium-ingest"
+    },
+    {
+      "key": "doneLabel",
+      "type": "string",
+      "title": "Gmail done label",
+      "description": "This Gmail label is added after successful import, and the ingest label is removed.",
+      "default": "trilium-done"
+    },
+    {
+      "key": "maxMessages",
+      "type": "number",
+      "title": "Maximum messages per account per run",
+      "description": "The hourly worker processes at most this many messages for each connected account.",
+      "default": 25
+    },
+    {
+      "key": "maxAttachmentBytes",
+      "type": "number",
+      "title": "Maximum attachment size",
+      "description": "Attachments larger than this are skipped with a warning in the imported note. Default: 25 MiB.",
+      "default": 26214400
+    },
+    {
+      "key": "endpointSecret",
+      "type": "secret",
+      "title": "Manual sync endpoint secret",
+      "description": "Required by the dashboard’s manual sync request because custom endpoints are public when backend scripting is enabled.",
+      "default": ""
+    },
+    {
+      "key": "accounts",
+      "type": "secret",
+      "title": "Connected Gmail accounts",
+      "description": "Managed by the Connect Gmail account button. Do not edit this field manually.",
+      "default": []
+    }
+  ],
+  "artifacts": [
+    {
+      "id": "gmail-ingest-worker",
+      "type": "backend",
+      "source": "src/gmail-ingest.js",
+      "integrity": "sha256-QGucjk0GaSb+54BB0rqfpCif+V8XK/Kjou3Yum8B064=",
+      "title": "Gmail Ingest worker",
+      "activation": "schedule",
+      "schedule": "hourly"
+    },
+    {
+      "id": "gmail-ingest-endpoint",
+      "type": "endpoint",
+      "source": "src/gmail-ingest.js",
+      "integrity": "sha256-QGucjk0GaSb+54BB0rqfpCif+V8XK/Kjou3Yum8B064=",
+      "title": "Gmail Ingest OAuth and sync endpoint",
+      "activation": "request",
+      "route": "gmail-ingest/(oauth/start|oauth/callback|process)"
+    },
+    {
+      "id": "gmail-ingest-dashboard",
+      "type": "render",
+      "source": "src/gmail-ingest-dashboard.jsx",
+      "integrity": "sha256-Q++FCD6OmZnVaZukNiVtvIiXP1dx//OgwmTiQyLjaFE=",
+      "title": "Gmail Ingest"
+    }
+  ]
+}
