@@ -14,14 +14,20 @@ export default function GmailIngest() {
 
     async function load() {
         try {
-            const note = await api.searchForNote(`#packageOwner=${PACKAGE_ID}`);
-            const accounts = parseJson(note?.getOwnedLabelValue("packageSetting:accounts"), []);
-            const endpointSecret = parseJson(note?.getOwnedLabelValue("packageSetting:endpointSecret"), "");
+            // Every artifact note of this package carries #packageOwner, so the manifest — the
+            // note that actually holds the settings — has to be selected explicitly.
+            const notes = await api.searchForNotes(`#packageOwner=${PACKAGE_ID}`);
+            const note = notes.find((candidate) => candidate.getOwnedLabelValue("packageArtifact") === "manifest");
+            if (!note) {
+                setStatus("The Gmail Ingest package manifest note was not found. Reinstall or re-enable the package.");
+                return;
+            }
+            const accounts = readSetting(note, "accounts", []);
             setSettings({
                 accounts: Array.isArray(accounts) ? accounts.map((account) => ({ email: account.email })) : [],
-                endpointSecret: String(endpointSecret || ""),
-                lastRunAt: note?.getOwnedLabelValue("gmailLastRunAt") || "",
-                lastRunSummary: parseJson(note?.getOwnedLabelValue("gmailLastRunSummary"), null)
+                endpointSecret: String(readSetting(note, "endpointSecret", "")),
+                lastRunAt: note.getOwnedLabelValue("gmailLastRunAt") || "",
+                lastRunSummary: parseJson(note.getOwnedLabelValue("gmailLastRunSummary"), null)
             });
             setStatus("");
         } catch (error) {
@@ -29,10 +35,28 @@ export default function GmailIngest() {
         }
     }
 
-    function connect() {
-        const url = new URL(OAUTH_START, window.location.origin);
-        if (accountHint.trim()) url.searchParams.set("account", accountHint.trim());
-        window.location.href = url.toString();
+    async function connect() {
+        if (!settings.endpointSecret) {
+            setStatus("Set a Manual sync endpoint secret in Plugins settings first.");
+            return;
+        }
+        setBusy(true);
+        setStatus("Contacting Google…");
+        try {
+            const response = await fetch(OAUTH_START, {
+                method: "POST",
+                headers: { "content-type": "application/json" },
+                body: JSON.stringify({ secret: settings.endpointSecret, account: accountHint.trim() })
+            });
+            const payload = await response.json().catch(() => ({}));
+            if (!response.ok || !payload.authorizeUrl) {
+                throw new Error(payload.error || `Could not start the Google sign-in (${response.status})`);
+            }
+            window.location.href = payload.authorizeUrl;
+        } catch (error) {
+            setStatus(error instanceof Error ? error.message : String(error));
+            setBusy(false);
+        }
     }
 
     async function processNow() {
@@ -80,6 +104,17 @@ export default function GmailIngest() {
             <p style={{ marginTop: "1.5em" }}>Before connecting, configure the Google OAuth client ID, client secret, target note ID, and a manual sync endpoint secret in Settings → Plugins. Add the exact callback URL shown by the OAuth error to the Google Cloud OAuth client if Google requires it.</p>
         </div>
     );
+}
+
+/*
+ * Settings are stored as label values, which are JSON only when the setting is structured.
+ * A plain string setting such as the endpoint secret is stored verbatim, so an unparseable
+ * value falls back to the raw string exactly as the backend's readSettings does.
+ */
+function readSetting(note, key, fallback) {
+    const stored = note.getOwnedLabelValue(`packageSetting:${key}`);
+    if (stored === null || stored === undefined || stored === "") return fallback;
+    return parseJson(stored, stored);
 }
 
 function parseJson(value, fallback) {

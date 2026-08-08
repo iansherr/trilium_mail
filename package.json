@@ -1,0 +1,10 @@
+{
+  "private": true,
+  "description": "Tooling entry point only. This repository ships a Trilium package, not an npm package: its identity, version, and payload live in trilium-package.json.",
+  "scripts": {
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

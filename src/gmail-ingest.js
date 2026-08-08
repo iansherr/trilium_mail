@@ -14,41 +14,56 @@ const GOOGLE_USERINFO_URL = "https://openidconnect.googleapis.com/v1/userinfo";
 const OAUTH_SCOPE = "openid email profile https://www.googleapis.com/auth/gmail.modify";
 const LOCK_TIMEOUT_MS = 10 * 60 * 1000;
 
-if (api.req && api.res) {
-    handleRequest().catch((error) => {
-        if (!api.res.headersSent) api.res.status(500).json({ error: errorMessage(error) });
-    });
-} else {
-    runIngest().catch((error) => api.log("Gmail Ingest failed:", errorMessage(error)));
+/* Access tokens keyed by account email. The script is evaluated per execution, so this cache
+ * lives for exactly one run, which is the scope it is meant to cover. */
+const accessTokens = new Map();
+
+/*
+ * Trilium evaluates this file with an `api` object in scope, so its absence means the file was
+ * loaded by the test suite instead. Guarding the entrypoint on it is what lets the pure helpers
+ * below be required and tested directly; see the export at the end of the file.
+ */
+if (typeof api !== "undefined") {
+    if (api.req && api.res) {
+        handleRequest().catch((error) => {
+            if (!api.res.headersSent) api.res.status(500).json({ error: errorMessage(error) });
+        });
+    } else {
+        runIngest().catch((error) => api.log("Gmail Ingest failed:", errorMessage(error)));
+    }
 }
 
 async function handleRequest() {
     const route = api.pathParams?.[0] || "";
 
-    if (route === "oauth/start") {
-        await startOAuth();
-        return;
-    }
+    // Custom endpoints are reachable by anyone who can reach the host, so every route
+    // that acts on this instance requires the manual sync endpoint secret. oauth/callback
+    // is the exception: Google controls that request and cannot carry the secret, so it is
+    // gated by the short-lived state value that only an authorised oauth/start can mint.
     if (route === "oauth/callback") {
         await finishOAuth();
         return;
     }
-    if (route === "process") {
+    if (route === "oauth/start" || route === "process") {
+        if (api.req.method !== "POST") {
+            api.res.status(405).json({ error: "This Gmail Ingest route requires a POST request." });
+            return;
+        }
         const settings = readSettings();
         const body = api.req.body && typeof api.req.body === "object" ? api.req.body : {};
-        if (!settings.endpointSecret || body.secret !== settings.endpointSecret) {
+        if (!secretMatches(settings.endpointSecret, body.secret)) {
             api.res.status(401).json({ error: "Invalid manual sync endpoint secret." });
             return;
         }
-        api.res.json(await runIngest());
+        if (route === "oauth/start") await startOAuth(settings, body);
+        else api.res.json(await runIngest());
         return;
     }
 
     api.res.status(404).json({ error: "Unknown Gmail Ingest route." });
 }
 
-async function startOAuth() {
-    const settings = readSettings();
+async function startOAuth(settings, body) {
     requireOAuthSettings(settings);
 
     const state = randomState();
@@ -57,7 +72,7 @@ async function startOAuth() {
     settings.manifest.setLabel("gmailOauthStateExpiresAt", String(expiresAt));
 
     const redirectUri = getRedirectUri(settings);
-    const accountHint = typeof api.req.query?.account === "string" ? api.req.query.account.trim() : "";
+    const accountHint = typeof body.account === "string" ? body.account.trim() : "";
     const params = new URLSearchParams({
         client_id: settings.clientId,
         redirect_uri: redirectUri,
@@ -69,7 +84,7 @@ async function startOAuth() {
     });
     if (accountHint) params.set("login_hint", accountHint);
 
-    api.res.redirect(`${GOOGLE_AUTH_URL}?${params.toString()}`);
+    api.res.json({ authorizeUrl: `${GOOGLE_AUTH_URL}?${params.toString()}`, redirectUri });
 }
 
 async function finishOAuth() {
@@ -135,12 +150,11 @@ async function runIngest() {
         return summary;
     }
 
-    const lock = Number(settings.manifest.getOwnedLabelValue("gmailRunLock") || 0);
-    if (lock && Date.now() - lock < LOCK_TIMEOUT_MS) {
+    const lockToken = acquireRunLock(settings.manifest);
+    if (!lockToken) {
         return { imported: 0, skipped: 0, failed: 0, accounts: settings.accounts.length, locked: true, message: "An import is already running." };
     }
 
-    settings.manifest.setLabel("gmailRunLock", String(Date.now()));
     const summary = { imported: 0, skipped: 0, failed: 0, accounts: settings.accounts.length, errors: [] };
     try {
         for (const account of settings.accounts) {
@@ -159,8 +173,30 @@ async function runIngest() {
         saveRunSummary(settings.manifest, summary);
         return summary;
     } finally {
-        settings.manifest.removeLabel("gmailRunLock");
+        releaseRunLock(settings.manifest, lockToken);
     }
+}
+
+/*
+ * The hourly worker and a dashboard "Sync now" can start in the same window, so the lock is
+ * claimed inside a transaction rather than with a separate read and write. Each run stores a
+ * unique token and only releases a lock that still carries its own token, so a run that loses
+ * the race can never drop the lock the winner is holding.
+ */
+function acquireRunLock(manifest) {
+    const token = `${Date.now()}:${api.randomString(12)}`;
+    const acquired = api.transactional(() => {
+        const current = String(manifest.getOwnedLabelValue("gmailRunLock") || "");
+        const startedAt = Number(current.split(":")[0] || 0);
+        if (current && startedAt && Date.now() - startedAt < LOCK_TIMEOUT_MS) return false;
+        manifest.setLabel("gmailRunLock", token);
+        return true;
+    });
+    return acquired ? token : "";
+}
+
+function releaseRunLock(manifest, token) {
+    if (manifest.getOwnedLabelValue("gmailRunLock") === token) manifest.removeLabel("gmailRunLock");
 }
 
 async function ingestAccount(settings, account) {
@@ -297,8 +333,8 @@ async function parseMessage(settings, account, message) {
     const headers = Object.fromEntries((message.payload?.headers || []).map((header) => [String(header.name || "").toLowerCase(), String(header.value || "")]));
     const parts = [];
     walkParts(message.payload || {}, parts);
-    let html = parts.find((part) => part.mime === "text/html" && part.data)?.data || "";
-    const text = parts.find((part) => part.mime === "text/plain" && part.data)?.data || "";
+    let html = parts.find((part) => part.kind === "body" && part.mime === "text/html" && part.data)?.data || "";
+    const text = parts.find((part) => part.kind === "body" && part.mime === "text/plain" && part.data)?.data || "";
     if (!html && !text && message.payload?.body?.data) {
         if (message.payload.mimeType === "text/html") html = decodeBase64Url(message.payload.body.data).toString("utf8");
     }
@@ -306,7 +342,13 @@ async function parseMessage(settings, account, message) {
 
     const attachments = [];
     const warnings = [];
-    for (const part of parts.filter((candidate) => candidate.filename || candidate.attachmentId)) {
+    for (const part of parts.filter((candidate) => candidate.kind === "attachment")) {
+        // Gmail reports the part size in the message metadata, so oversized attachments are
+        // skipped before they are downloaded rather than after they are already in memory.
+        if (part.size && part.size > settings.maxAttachmentBytes) {
+            warnings.push(`Skipped ${part.filename || "an attachment"}: it is ${formatBytes(part.size)}, over the configured limit.`);
+            continue;
+        }
         try {
             const encoded = part.data || (part.attachmentId ? (await gmailRequest(settings, account, `/messages/${encodeURIComponent(message.id)}/attachments/${encodeURIComponent(part.attachmentId)}`)).data : "");
             const content = encoded instanceof Uint8Array ? encoded : decodeBase64Url(encoded || "");
@@ -339,14 +381,19 @@ function walkParts(part, result) {
     const body = part.body || {};
     const filename = String(part.filename || "");
     const headers = Object.fromEntries((part.headers || []).map((header) => [String(header.name || "").toLowerCase(), String(header.value || "")]));
-    if (part.mimeType === "text/html" || part.mimeType === "text/plain") {
-        result.push({ mime: part.mimeType, data: body.data ? decodeBase64Url(body.data).toString("utf8") : "" });
+    const isAttachment = Boolean(filename || body.attachmentId);
+    // An attached .html or .txt file is still an attachment: it must not become a candidate
+    // for the message body, or it would replace the real body of a multipart/mixed message.
+    if (!isAttachment && (part.mimeType === "text/html" || part.mimeType === "text/plain")) {
+        result.push({ kind: "body", mime: part.mimeType, data: body.data ? decodeBase64Url(body.data).toString("utf8") : "" });
     }
-    if (filename || body.attachmentId) {
+    if (isAttachment) {
         result.push({
+            kind: "attachment",
             mime: String(part.mimeType || "application/octet-stream").toLowerCase(),
             filename,
             attachmentId: body.attachmentId,
+            size: Number(body.size || 0),
             data: body.data ? decodeBase64Url(body.data) : null,
             contentId: headers["content-id"] || ""
         });
@@ -379,17 +426,25 @@ async function modifyMessage(settings, account, messageId, body) {
 }
 
 async function gmailRequest(settings, account, path, init = {}) {
-    const accessToken = await refreshAccessToken(settings, account);
+    const accessToken = await getAccessToken(settings, account);
     const headers = { ...(init.headers || {}), authorization: `Bearer ${accessToken}` };
     let response = await fetch(`${GMAIL_API}${path}`, { ...init, headers });
     if (response.status === 401) {
-        const retryToken = await refreshAccessToken(settings, account);
+        const retryToken = await getAccessToken(settings, account, true);
         response = await fetch(`${GMAIL_API}${path}`, { ...init, headers: { ...(init.headers || {}), authorization: `Bearer ${retryToken}` } });
     }
     return readJsonResponse(response, "Gmail API request");
 }
 
-async function refreshAccessToken(settings, account) {
+/*
+ * A run issues two Gmail calls per message, and exchanging the refresh token on each of them
+ * would mean dozens of token requests per account per hour, which Google rate-limits. The
+ * access token is reused for its advertised lifetime; the 401 path above forces a refresh.
+ */
+async function getAccessToken(settings, account, force = false) {
+    const cached = accessTokens.get(account.email);
+    if (!force && cached && Date.now() < cached.expiresAt) return cached.token;
+
     const response = await fetch(GOOGLE_TOKEN_URL, {
         method: "POST",
         headers: { "content-type": "application/x-www-form-urlencoded" },
@@ -402,6 +457,12 @@ async function refreshAccessToken(settings, account) {
     });
     const tokens = await readJsonResponse(response, `Refresh token for ${account.email}`);
     if (!tokens.access_token) throw new Error(`Google returned no access token for ${account.email}.`);
+
+    const lifetimeSeconds = Math.max(0, Number(tokens.expires_in) || 0);
+    accessTokens.set(account.email, {
+        token: tokens.access_token,
+        expiresAt: Date.now() + Math.max(0, lifetimeSeconds - 60) * 1000
+    });
     return tokens.access_token;
 }
 
@@ -444,11 +505,25 @@ function requireOAuthSettings(settings) {
     if (!settings.clientId || !settings.clientSecret) throw new Error("Set the Google OAuth client ID and client secret in Plugins settings first.");
 }
 
+/*
+ * Trilium is commonly served behind a TLS-terminating reverse proxy, where req.protocol reads
+ * as http unless Express is configured to trust the proxy. Inferring https from that would send
+ * Google a redirect_uri it rejects, so the forwarded headers win where they can be believed.
+ *
+ * They are only believed when Express trusts the proxy, which is the same control req.protocol
+ * honours: on an instance reachable directly, the headers are set by whoever is calling, and
+ * reading them anyway would let that caller choose the redirect_uri handed back here. Setting the
+ * OAuth redirect URI explicitly avoids the guess entirely, and is the fix when the proxy in front
+ * of Trilium sends the headers without Trilium being configured to trust it.
+ */
 function getRedirectUri(settings) {
     if (settings.redirectUri) return settings.redirectUri;
-    const origin = `${api.req.protocol}://${api.req.get("host")}`;
+    const trustsProxy = Boolean(api.req.app?.get?.("trust proxy"));
+    const firstValue = (header) => (trustsProxy ? String(api.req.get(header) || "").split(",")[0].trim() : "");
+    const protocol = firstValue("x-forwarded-proto") || api.req.protocol || "https";
+    const host = firstValue("x-forwarded-host") || api.req.get("host") || "";
     const currentPath = String(api.req.originalUrl || api.req.url || "").split("?")[0];
-    return `${origin}${currentPath.replace(/\/oauth\/(?:start|callback)$/, "/oauth/callback")}`;
+    return `${protocol}://${host}${currentPath.replace(/\/oauth\/(?:start|callback)$/, "/oauth/callback")}`;
 }
 
 function saveRunSummary(manifest, summary) {
@@ -470,11 +545,216 @@ function normalizeContentId(value) {
     return String(value || "").replace(/^<|>$/g, "").trim();
 }
 
+/*
+ * Message bodies are untrusted HTML written straight into a note, so the sanitizer rebuilds the
+ * markup from an allowlist rather than trying to strip the dangerous parts out of it. Anything
+ * not recognised is dropped, which fails closed on the markup a stripping pass tends to miss:
+ * unclosed tags, whitespace around attribute "=", entity-encoded URL schemes. This is not a full
+ * HTML5 parser, but rebuilding means unrecognised constructs cannot survive into the output.
+ */
+const ALLOWED_TAGS = new Set([
+    "a", "abbr", "b", "blockquote", "br", "caption", "center", "code", "col", "colgroup", "dd",
+    "div", "dl", "dt", "em", "figcaption", "figure", "font", "h1", "h2", "h3", "h4", "h5", "h6",
+    "hr", "i", "img", "li", "ol", "p", "pre", "s", "small", "span", "strong", "sub", "sup",
+    "table", "tbody", "td", "tfoot", "th", "thead", "tr", "u", "ul"
+]);
+const ALLOWED_ATTRIBUTES = new Set([
+    "align", "alt", "bgcolor", "border", "cellpadding", "cellspacing", "class", "color",
+    "colspan", "dir", "face", "height", "href", "lang", "rowspan", "size", "span", "src",
+    "style", "title", "valign", "width"
+]);
+const URL_ATTRIBUTES = new Set(["href", "src"]);
+const VOID_TAGS = new Set(["br", "col", "hr", "img"]);
+/* Tags whose text content must go with them, or a dropped <script> would leave its code as
+ * visible note text. */
+const DROP_CONTENT_TAGS = new Set([
+    "head", "iframe", "math", "noscript", "object", "embed", "script", "style", "svg",
+    "template", "textarea", "title"
+]);
+const UNSAFE_STYLE_PATTERN = /expression\s*\(|javascript\s*:|vbscript\s*:|behavior\s*:|-moz-binding|@import/i;
+
 function sanitizeHtml(html) {
-    return String(html || "")
-        .replace(/<\/?(script|iframe|object|embed|form)(?:\s[^>]*)?>[\s\S]*?<\/\1>/gi, "")
-        .replace(/\son\w+=(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, "")
-        .trim();
+    const input = String(html || "");
+    let out = "";
+    let index = 0;
+    /* Names already searched for and not found. The scan only moves forward, so a close tag
+     * missing from here on is missing for every later tag of that name too, and repeating the
+     * search once per tag is what makes a body of unclosed <svg> take quadratic time. */
+    const unclosed = new Set();
+
+    while (index < input.length) {
+        const start = input.indexOf("<", index);
+        if (start === -1) {
+            out += input.slice(index);
+            break;
+        }
+        out += input.slice(index, start);
+
+        if (input.startsWith("<!--", start)) {
+            const end = input.indexOf("-->", start + 4);
+            index = end === -1 ? input.length : end + 3;
+            continue;
+        }
+        if (input.startsWith("<!", start) || input.startsWith("<?", start)) {
+            const end = input.indexOf(">", start);
+            index = end === -1 ? input.length : end + 1;
+            continue;
+        }
+
+        const tag = readTag(input, start);
+        if (!tag) {
+            out += "&lt;";
+            index = start + 1;
+            continue;
+        }
+        index = tag.end;
+
+        if (tag.closing) {
+            if (ALLOWED_TAGS.has(tag.name) && !VOID_TAGS.has(tag.name)) out += `</${tag.name}>`;
+            continue;
+        }
+        if (DROP_CONTENT_TAGS.has(tag.name)) {
+            if (!tag.selfClosing) index = endOfDroppedContent(input, tag, unclosed);
+            continue;
+        }
+        if (ALLOWED_TAGS.has(tag.name)) out += renderOpenTag(tag);
+    }
+
+    return out.trim();
+}
+
+/*
+ * Reads one tag, tracking quoted attribute values so that a ">" inside one does not end it.
+ * Only a quote that opens a value counts, because an apostrophe in an unquoted value
+ * (title=Bob's) is ordinary text, and treating it as a delimiter would run the scan past the
+ * real ">". Machine-generated email HTML also leaves values unterminated (width="100>), so a
+ * scan that reaches the end of the input falls back to the first ">" rather than reporting a
+ * tag that swallows the rest of the message.
+ */
+function readTag(input, start) {
+    const match = /^<(\/?)([a-zA-Z][a-zA-Z0-9-]*)/.exec(input.slice(start, start + 64));
+    if (!match) return null;
+
+    const bodyStart = start + match[0].length;
+    let cursor = bodyStart;
+    let quote = "";
+    let afterEquals = false;
+    let end = -1;
+    while (cursor < input.length) {
+        const char = input[cursor];
+        if (quote) {
+            if (char === quote) quote = "";
+        } else if (char === ">") {
+            end = cursor;
+            break;
+        } else if (afterEquals && (char === '"' || char === "'")) {
+            quote = char;
+            afterEquals = false;
+        } else if (char === "=") {
+            afterEquals = true;
+        } else if (!/\s/.test(char)) {
+            afterEquals = false;
+        }
+        cursor += 1;
+    }
+    if (end === -1) {
+        end = input.indexOf(">", bodyStart);
+        if (end === -1) end = input.length;
+    }
+
+    const body = input.slice(bodyStart, end);
+    return {
+        name: match[2].toLowerCase(),
+        closing: match[1] === "/",
+        selfClosing: /\/\s*$/.test(body),
+        body,
+        end: Math.min(end + 1, input.length)
+    };
+}
+
+/*
+ * Finds where a dropped element's content ends. A missing close tag must not consume the rest of
+ * the message, so an unclosed element drops only its own tag and its text is left to the main
+ * loop, where it becomes inert note text: the dangerous part is the tag, not the characters.
+ */
+function endOfDroppedContent(input, tag, unclosed) {
+    if (unclosed.has(tag.name)) return tag.end;
+    // Searched with lastIndex rather than on a slice, so that a body of unclosed tags does not
+    // copy the rest of the message once per tag.
+    const pattern = new RegExp(`</${tag.name}(?:[\\s/>]|$)`, "gi");
+    pattern.lastIndex = tag.end;
+    const closing = pattern.exec(input);
+    if (!closing) {
+        unclosed.add(tag.name);
+        return tag.end;
+    }
+    const close = input.indexOf(">", closing.index);
+    return close === -1 ? input.length : close + 1;
+}
+
+function renderOpenTag(tag) {
+    const pattern = /([a-zA-Z_:][-a-zA-Z0-9_:.]*)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'`=<>]+)))?/g;
+    let rendered = `<${tag.name}`;
+    let hasHref = false;
+    let match;
+
+    while ((match = pattern.exec(tag.body)) !== null) {
+        const name = match[1].toLowerCase();
+        if (!ALLOWED_ATTRIBUTES.has(name)) continue;
+
+        const value = decodeEntities(match[2] ?? match[3] ?? match[4] ?? "");
+        if (URL_ATTRIBUTES.has(name) && !isSafeUrl(value)) continue;
+        if (name === "style" && UNSAFE_STYLE_PATTERN.test(value)) continue;
+        if (name === "href") hasHref = true;
+        rendered += ` ${name}="${escapeAttribute(value)}"`;
+    }
+
+    if (tag.name === "a" && hasHref) rendered += ' rel="noopener noreferrer"';
+    return `${rendered}>`;
+}
+
+function isSafeUrl(value) {
+    // Control characters are stripped first: browsers ignore them, so "java\tscript:" would
+    // otherwise slip past a scheme check that a browser still resolves as javascript:.
+    const url = value.replace(/[\u0000-\u0020]/g, "").toLowerCase();
+    // Backslashes are normalised the way browsers normalise them, so "\\host/path" is recognised
+    // as the protocol-relative URL it resolves to rather than as a relative path.
+    const relative = url.replaceAll("\\", "/");
+    if (relative.startsWith("//")) return !relative.startsWith("///");
+    if (relative.startsWith("#")) return true;
+    // A relative URL resolves against the note, so email HTML could use one to make the browser
+    // issue a request to Trilium's own API carrying the reader's session. Nothing in a message can
+    // mean anything by a relative URL anyway, having no base document to resolve against.
+    if (!/^[a-z][a-z0-9+.-]*:/.test(url)) return false;
+    // cid: is kept because importMessage rewrites those references to saved attachments, which it
+    // does after this sanitizer has run.
+    if (/^(?:https?|mailto|tel|cid):/.test(url)) return true;
+    return /^data:image\/(?:png|jpe?g|gif|webp|bmp);base64,/.test(url);
+}
+
+function decodeEntities(value) {
+    return String(value)
+        .replace(/&#x([0-9a-f]+);?/gi, (_match, hex) => safeCodePoint(parseInt(hex, 16)))
+        .replace(/&#(\d+);?/g, (_match, digits) => safeCodePoint(parseInt(digits, 10)))
+        .replace(/&(quot|apos|lt|gt|nbsp|amp);/gi, (_match, name) => ({
+            quot: '"', apos: "'", lt: "<", gt: ">", nbsp: " ", amp: "&"
+        })[name.toLowerCase()]);
+}
+
+function safeCodePoint(code) {
+    return Number.isFinite(code) && code >= 0 && code <= 0x10ffff ? String.fromCodePoint(code) : "";
+}
+
+/* Compares in constant time so a wrong secret cannot be recovered from response timing. */
+function secretMatches(expected, provided) {
+    const left = String(expected || "");
+    const right = typeof provided === "string" ? provided : "";
+    if (!left || left.length !== right.length) return false;
+    let difference = 0;
+    for (let index = 0; index < left.length; index += 1) {
+        difference |= left.charCodeAt(index) ^ right.charCodeAt(index);
+    }
+    return difference === 0;
 }
 
 function escapeHtml(value) {
@@ -497,6 +777,15 @@ function formatBytes(bytes) {
     if (bytes < 1024) return `${bytes} B`;
     if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KiB`;
     return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
+}
+
+/*
+ * Trilium does not evaluate this file as a CommonJS module, so `module` is absent there and this
+ * is inert. Under `node --test` it exposes the helpers that are worth testing without a running
+ * Trilium: the ones that are pure, or that read only from a mockable `api` global.
+ */
+if (typeof module !== "undefined" && module.exports) {
+    module.exports = { sanitizeHtml, isSafeUrl, readTag, getRedirectUri, secretMatches, escapeHtml, escapeAttribute };
 }
 
 function errorMessage(error) {

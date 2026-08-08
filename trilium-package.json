@@ -31,7 +31,7 @@
       "key": "redirectUri",
       "type": "string",
       "title": "OAuth redirect URI",
-      "description": "Optional exact callback URL. Leave blank to infer https://host/custom/gmail-ingest/oauth/callback from the current request.",
+      "description": "Exact callback URL. Recommended behind a reverse proxy. Leave blank to infer https://host/custom/gmail-ingest/oauth/callback from the current request and its forwarded headers.",
       "default": ""
     },
     {
@@ -73,7 +73,7 @@
       "key": "endpointSecret",
       "type": "secret",
       "title": "Manual sync endpoint secret",
-      "description": "Required by the dashboard’s manual sync request because custom endpoints are public when backend scripting is enabled.",
+      "description": "Required before connecting an account or syncing manually, because custom endpoints are public when backend scripting is enabled. Use a long random value.",
       "default": ""
     },
     {
@@ -89,7 +89,7 @@
       "id": "gmail-ingest-worker",
       "type": "backend",
       "source": "src/gmail-ingest.js",
-      "integrity": "sha256-QGucjk0GaSb+54BB0rqfpCif+V8XK/Kjou3Yum8B064=",
+      "integrity": "sha256-+ixpijrfmFoEN10pSUbDRIH/eoM4kkAHKwERTPMqZ5s=",
       "title": "Gmail Ingest worker",
       "activation": "schedule",
       "schedule": "hourly"
@@ -98,7 +98,7 @@
       "id": "gmail-ingest-endpoint",
       "type": "endpoint",
       "source": "src/gmail-ingest.js",
-      "integrity": "sha256-QGucjk0GaSb+54BB0rqfpCif+V8XK/Kjou3Yum8B064=",
+      "integrity": "sha256-+ixpijrfmFoEN10pSUbDRIH/eoM4kkAHKwERTPMqZ5s=",
       "title": "Gmail Ingest OAuth and sync endpoint",
       "activation": "request",
       "route": "gmail-ingest/(oauth/start|oauth/callback|process)"
@@ -107,7 +107,7 @@
       "id": "gmail-ingest-dashboard",
       "type": "render",
       "source": "src/gmail-ingest-dashboard.jsx",
-      "integrity": "sha256-Q++FCD6OmZnVaZukNiVtvIiXP1dx//OgwmTiQyLjaFE=",
+      "integrity": "sha256-oTVf/iVVYvf3sQGY9C1BUGZamnNvXoqxPcurJmdHD6E=",
       "title": "Gmail Ingest"
     }
   ]
