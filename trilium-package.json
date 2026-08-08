@@ -89,7 +89,7 @@
       "id": "gmail-ingest-worker",
       "type": "backend",
       "source": "src/gmail-ingest.js",
-      "integrity": "sha256-1k5m6yuY+kX0pIEWZaGS/hGhnzzlz63roZZENVVDIbQ=",
+      "integrity": "sha256-+ixpijrfmFoEN10pSUbDRIH/eoM4kkAHKwERTPMqZ5s=",
       "title": "Gmail Ingest worker",
       "activation": "schedule",
       "schedule": "hourly"
@@ -98,7 +98,7 @@
       "id": "gmail-ingest-endpoint",
       "type": "endpoint",
       "source": "src/gmail-ingest.js",
-      "integrity": "sha256-1k5m6yuY+kX0pIEWZaGS/hGhnzzlz63roZZENVVDIbQ=",
+      "integrity": "sha256-+ixpijrfmFoEN10pSUbDRIH/eoM4kkAHKwERTPMqZ5s=",
       "title": "Gmail Ingest OAuth and sync endpoint",
       "activation": "request",
       "route": "gmail-ingest/(oauth/start|oauth/callback|process)"

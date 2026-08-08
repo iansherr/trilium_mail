@@ -577,6 +577,10 @@ function sanitizeHtml(html) {
     const input = String(html || "");
     let out = "";
     let index = 0;
+    /* Names already searched for and not found. The scan only moves forward, so a close tag
+     * missing from here on is missing for every later tag of that name too, and repeating the
+     * search once per tag is what makes a body of unclosed <svg> take quadratic time. */
+    const unclosed = new Set();
 
     while (index < input.length) {
         const start = input.indexOf("<", index);
@@ -610,7 +614,7 @@ function sanitizeHtml(html) {
             continue;
         }
         if (DROP_CONTENT_TAGS.has(tag.name)) {
-            if (!tag.selfClosing) index = endOfDroppedContent(input, tag);
+            if (!tag.selfClosing) index = endOfDroppedContent(input, tag, unclosed);
             continue;
         }
         if (ALLOWED_TAGS.has(tag.name)) out += renderOpenTag(tag);
@@ -673,10 +677,18 @@ function readTag(input, start) {
  * the message, so an unclosed element drops only its own tag and its text is left to the main
  * loop, where it becomes inert note text: the dangerous part is the tag, not the characters.
  */
-function endOfDroppedContent(input, tag) {
-    const closing = new RegExp(`</${tag.name}(?:[\\s/>]|$)`, "i").exec(input.slice(tag.end));
-    if (!closing) return tag.end;
-    const close = input.indexOf(">", tag.end + closing.index);
+function endOfDroppedContent(input, tag, unclosed) {
+    if (unclosed.has(tag.name)) return tag.end;
+    // Searched with lastIndex rather than on a slice, so that a body of unclosed tags does not
+    // copy the rest of the message once per tag.
+    const pattern = new RegExp(`</${tag.name}(?:[\\s/>]|$)`, "gi");
+    pattern.lastIndex = tag.end;
+    const closing = pattern.exec(input);
+    if (!closing) {
+        unclosed.add(tag.name);
+        return tag.end;
+    }
+    const close = input.indexOf(">", closing.index);
     return close === -1 ? input.length : close + 1;
 }
 

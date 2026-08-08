@@ -137,6 +137,25 @@ test("terminates on pathological input", () => {
     assert.ok(Date.now() - started < 3000, "sanitizer should not degrade to a full-input rescan per tag");
 });
 
+test("stays linear on a body of unclosed drop-content tags", () => {
+    // Searching for the close tag once per unclosed tag is quadratic, and this runs on attacker
+    // supplied bodies inside the hourly worker: at ~1MB it cost seconds before the search was
+    // given a start offset and a record of the names already found to be unclosed.
+    const build = (count) => "<svg>".repeat(count) + "x".repeat(count * 10);
+    const measure = (count) => {
+        const input = build(count);
+        const started = Date.now();
+        sanitizeHtml(input);
+        return Date.now() - started;
+    };
+    measure(10000); // discard the first run, which pays for JIT warm-up
+    const small = Math.max(measure(20000), 1);
+    const large = Math.max(measure(80000), 1);
+    // Quadratic growth over a 4x input would be ~16x; linear is ~4x. The bound is loose because
+    // wall-clock timing is noisy on shared CI runners, but it still separates the two.
+    assert.ok(large / small < 8, `4x the input took ${large}ms vs ${small}ms, which looks superlinear`);
+});
+
 test("handles empty, absent, and truncated input", () => {
     assert.strictEqual(sanitizeHtml(""), "");
     assert.strictEqual(sanitizeHtml(null), "");
